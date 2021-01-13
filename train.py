@@ -14,12 +14,14 @@ from utils import google_utils
 from utils.datasets import *
 from utils.utils import *
 
+from torch.cuda import amp
+
 mixed_precision = True
-try:  # Mixed precision training https://github.com/NVIDIA/apex
-    from apex import amp
-except:
-    print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
-    mixed_precision = False  # not installed
+# try:  # Mixed precision training https://github.com/NVIDIA/apex
+#     from apex import amp
+# except:
+#     print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
+#     mixed_precision = False  # not installed
 
 # Hyperparameters
 hyp = {'optimizer': 'SGD',  # ['adam', 'SGD', None] if none, default is SGD
@@ -63,6 +65,7 @@ def train(hyp, tb_writer, opt, device):
         yaml.dump(vars(opt), f, sort_keys=False)
 
     # Configure
+    cuda = device.type != 'cpu'
     init_seeds(2 + rank)
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.FullLoader)  # model dict
@@ -155,8 +158,8 @@ def train(hyp, tb_writer, opt, device):
         del ckpt
 
     # Mixed precision training https://github.com/NVIDIA/apex
-    if mixed_precision:
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
+    # if mixed_precision:
+    #     model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.8 + 0.2  # cosine
@@ -165,11 +168,11 @@ def train(hyp, tb_writer, opt, device):
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # DP mode
-    if device.type != 'cpu' and rank == -1 and torch.cuda.device_count() > 1:
+    if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
-    if opt.sync_bn and device.type != 'cpu' and rank != -1:
+    if opt.sync_bn and cuda and rank != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         print('Using SyncBatchNorm()')
 
@@ -177,7 +180,7 @@ def train(hyp, tb_writer, opt, device):
     ema = torch_utils.ModelEMA(model) if rank in [-1, 0] else None
 
     # DDP mode
-    if device.type != 'cpu' and rank != -1:
+    if cuda and rank != -1:
         model = DDP(model, device_ids=[rank], output_device=rank)
 
     # Trainloader
@@ -222,6 +225,7 @@ def train(hyp, tb_writer, opt, device):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
     scheduler.last_epoch = start_epoch - 1  # do not move
+    scaler = amp.GradScaler(enabled=cuda)
     if rank in [0, -1]:
         print('Image sizes %g train, %g test' % (imgsz, imgsz_test))
         print('Using %g dataloader workers' % dataloader.num_workers)
@@ -283,27 +287,39 @@ def train(hyp, tb_writer, opt, device):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Forward
-            pred = model(imgs)
+            # # Forward
+            # pred = model(imgs)
+            #
+            # # Loss
+            # loss, loss_items = compute_loss(pred, targets.to(device), model)  # scaled by batch_size
+            # if rank != -1:
+            #     loss *= opt.world_size  # gradient averaged between devices in DDP mode
+            # if not torch.isfinite(loss):
+            #     print('WARNING: non-finite loss, ending training ', loss_items)
+            #     return results
 
-            # Loss
-            loss, loss_items = compute_loss(pred, targets.to(device), model)  # scaled by batch_size
-            if rank != -1:
-                loss *= opt.world_size  # gradient averaged between devices in DDP mode
-            if not torch.isfinite(loss):
-                print('WARNING: non-finite loss, ending training ', loss_items)
-                return results
+            # Forward
+            with amp.autocast(enabled=cuda):
+                pred = model(imgs)  # forward
+                loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
+                if rank != -1:
+                    loss *= opt.world_size  # gradient averaged between devices in DDP mode
 
             # Backward
-            if mixed_precision:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+            scaler.scale(loss).backward()
+
+            # # Backward
+            # if mixed_precision:
+            #     with amp.scale_loss(loss, optimizer) as scaled_loss:
+            #         scaled_loss.backward()
+            # else:
+            #     loss.backward()
 
             # Optimize
             if ni % accumulate == 0:
-                optimizer.step()
+                # optimizer.step()
+                scaler.step(optimizer)  # optimizer.step
+                scaler.update()
                 optimizer.zero_grad()
                 if ema is not None:
                     ema.update(model)
@@ -397,6 +413,20 @@ def train(hyp, tb_writer, opt, device):
             plot_results(save_dir=log_dir)  # save as results.png
         print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
 
+        # Test best.pt
+        if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
+            results, _, _ = test.test(opt.data,
+                                      batch_size=total_batch_size,
+                                      imgsz=imgsz_test,
+                                      model=attempt_load(best if best.exists() else last, device).half(),
+                                      single_cls=opt.single_cls,
+                                      dataloader=testloader,
+                                      save_dir=save_dir,
+                                      save_json=True,  # use pycocotools
+                                      plots=False)
+    else:
+        dist.destroy_process_group()
+
     dist.destroy_process_group() if rank not in [-1, 0] else None
     torch.cuda.empty_cache()
     return results
@@ -441,7 +471,7 @@ if __name__ == '__main__':
         with open(opt.hyp) as f:
             hyp.update(yaml.load(f, Loader=yaml.FullLoader))  # update hyps
     opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
-    device = torch_utils.select_device(opt.device, apex=mixed_precision, batch_size=opt.batch_size)
+    device = torch_utils.select_device(opt.device, batch_size=opt.batch_size)
     opt.total_batch_size = opt.batch_size
     opt.world_size = 1
     if device.type == 'cpu':
